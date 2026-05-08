@@ -1,42 +1,85 @@
-// script.js - [기본 코드] GPT와 직접 통신하기
-// 목표: 백엔드 서버(/chat)로 메시지를 보내고, GPT 응답을 console.log로 확인하기
+const API_BASE_URL = "http://localhost:8000";
+let isSending = false;
+
+function appendMessage(role, text) {
+    const chatWindow = document.getElementById("chat-window");
+    const messageElement = document.createElement("div");
+    messageElement.className = "message " + role;
+    messageElement.textContent = text;
+    chatWindow.appendChild(messageElement);
+    chatWindow.scrollTop = chatWindow.scrollHeight;
+}
 
 function sendMessage() {
-    // 1. 입력창에서 사용자가 입력한 텍스트 가져오기
-    const inputElement = document.getElementById("user-input");
-    const userMessage = inputElement.value;
-
-    // 빈 메시지면 실행 안 함
-    if (userMessage === "") {
-        console.log("메시지를 입력해주세요!");
+    if (isSending) {
         return;
     }
 
-    console.log("=== 채팅 시작 ===");
-    console.log("내가 보낸 메시지:", userMessage);
+    const inputElement = document.getElementById("user-input");
+    const userMessage = inputElement.value.trim();
+    const sendButton = document.querySelector('button[onclick="sendMessage()"]');
 
-    // 2. 서버로 메시지 보내기 (fetch API 사용)
-    fetch("http://localhost:8000/chat", {
+    if (userMessage === "") {
+        return;
+    }
+
+    isSending = true;
+    if (sendButton) {
+        sendButton.disabled = true;
+    }
+
+    appendMessage("user", userMessage);
+    inputElement.value = "";
+
+    fetch(API_BASE_URL + "/integrated-chat", {
         method: "POST",
         headers: {
             "Content-Type": "application/json"
         },
         body: JSON.stringify({ message: userMessage })
     })
-    .then(function(response) {
-        // 3. 서버 응답을 JSON으로 변환
-        return response.json();
-    })
-    .then(function(data) {
-        // 4. 콘솔에 결과 출력
-        console.log("GPT의 답변:", data.answer);
-        console.log("=== 채팅 끝 ===");
-
-        // 입력창 비우기
-        inputElement.value = "";
-    })
-    .catch(function(error) {
-        console.error("오류 발생:", error);
-        console.log("서버가 켜져 있는지 확인해주세요!");
-    });
+        .then(function(response) {
+            return response.json().then(function(data) {
+                if (!response.ok) {
+                    throw new Error(data.detail || "서버 요청에 실패했습니다.");
+                }
+                return data;
+            });
+        })
+        .then(function(data) {
+            appendMessage("bot", data.answer || "응답을 생성하지 못했습니다.");
+            console.log("RAG sources:", data.sources || []);
+        })
+        .catch(function(error) {
+            appendMessage("bot", "오류가 발생했습니다: " + error.message);
+            console.error(error);
+        })
+        .finally(function() {
+            isSending = false;
+            if (sendButton) {
+                sendButton.disabled = false;
+            }
+        });
 }
+
+function toggleUpload() {
+    const panel = document.getElementById("upload-panel");
+    if (!panel) {
+        return;
+    }
+    panel.style.display = panel.style.display === "none" || panel.style.display === "" ? "block" : "none";
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+    const inputElement = document.getElementById("user-input");
+    if (!inputElement) {
+        return;
+    }
+
+    inputElement.addEventListener("keydown", function(event) {
+        if (event.key === "Enter" && !event.shiftKey) {
+            event.preventDefault();
+            sendMessage();
+        }
+    });
+});

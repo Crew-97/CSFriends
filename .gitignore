@@ -1,22 +1,22 @@
+# Environment variables and secrets
+.env
+.env.local
+
 # Python
 __pycache__/
+**pycache**/
+*.pyc
 *.py[cod]
 *.egg-info/
 .venv/
 venv/
 env/
 
-# ChromaDB 벡터 저장소
-/servers/chroma_data/
-
-# 업로드된 사용자 데이터 (예시 파일 제외)
-# /servers/data/*.pdf
+# ChromaDB vector stores
+chroma_data/
+servers/chroma_data/
 
 # IDE
 .idea/
 .vscode/
 *.swp
-
-# 환경변수
-.env
-.env.local
