@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ChromaDB 벡터 저장소
+/servers/chroma_data/
+
+# 업로드된 사용자 데이터 (예시 파일 제외)
+# /servers/data/*.pdf
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 환경변수
+.env
+.env.local
