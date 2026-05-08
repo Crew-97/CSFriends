@@ -1,4 +1,5 @@
 # CSFriends RAG Chatbot
+<img width="1920" height="1683" alt="image" src="https://github.com/user-attachments/assets/47e43962-6c1c-4ef2-82ba-e00e08bd7fc3" />
 
 CSFriends는 CS 면접 및 기술 문서 데이터를 기반으로 답변하는 RAG 챗봇 프로젝트입니다. 기존 Frontend 디자인은 유지하고, FastAPI Backend에서 문서 재귀 탐색, 청킹, 임베딩, ChromaDB 검색, OpenAI 응답 생성을 담당합니다.
 
