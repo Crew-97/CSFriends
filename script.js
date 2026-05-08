@@ -3,11 +3,30 @@ let isSending = false;
 
 function appendMessage(role, text) {
     const chatWindow = document.getElementById("chat-window");
+    if (!chatWindow) {
+        return;
+    }
+
+    const emptyState = document.getElementById("emptyState");
+    if (emptyState) {
+        emptyState.style.display = "none";
+    }
+
     const messageElement = document.createElement("div");
     messageElement.className = "message " + role;
-    messageElement.textContent = text;
+
+    text
+        .trim()
+        .split(/\n+/)
+        .filter(Boolean)
+        .forEach(function(paragraph) {
+            const paragraphElement = document.createElement("p");
+            paragraphElement.textContent = paragraph;
+            messageElement.appendChild(paragraphElement);
+        });
+
     chatWindow.appendChild(messageElement);
-    chatWindow.scrollTop = chatWindow.scrollHeight;
+    messageElement.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function sendMessage() {
