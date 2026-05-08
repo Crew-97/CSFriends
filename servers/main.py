@@ -1,361 +1,500 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, Request, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse, JSONResponse
-import traceback
+import hashlib
+import io
 import logging
-from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer
-from openai import OpenAI
-import numpy as np
+import os
+import re
+import traceback
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
+
 import chromadb
 import pypdf
-import io
-
-# ==========================================
-# [설정 영역] 사용자 환경에 맞게 수정하세요.
-# ==========================================
-# OpenAI API 키 (https://platform.openai.com/api-keys)
-OPENAI_API_KEY = ""
-GPT_MODEL = "gpt-5.4-nano"   # 사용할 GPT 모델명
-
-# 데이터를 읽어올 폴더 경로 (이 폴더 안에 읽을 파일이 반드시 있어야 합니다)
-DATA_DIR = Path("./data")
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, RedirectResponse
+from openai import OpenAI
+from pydantic import BaseModel, Field
+from sentence_transformers import SentenceTransformer
 
 
-CHUNK_SIZE = 400                # 텍스트를 자를 단위 (글자 수)
-OVERLAP = 50                    # 청킹 시 겹치는 문자열 길이
-RAG_MODEL_NAME = 'jhgan/ko-sroberta-multitask' # 임베딩 모델 (한국어 특화)
-SIMILARITY_THRESHOLD = 0.40    # 검색 결과로 인정할 최소 유사도 점수
-CHROMA_DB_PATH = "./chroma_data" # ChromaDB 저장 경로
-# ==========================================
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
+logger = logging.getLogger("cs-rag-chatbot")
 
-# [전역 변수] 서버 실행 중 메모리에 유지될 변수들
-DB = []                     # 문서 내용과 출처를 담을 리스트
-DB_EMBEDDINGS = None        # Numpy 검색을 위한 벡터 데이터
-rag_model = None            # 임베딩 모델 (텍스트 -> 벡터 변환)
-openai_client = None        # OpenAI 연결 클라이언트
-collection = None           # ChromaDB 컬렉션 객체
+BASE_DIR = Path(__file__).resolve().parent
+ROOT_DIR = BASE_DIR.parent
+load_dotenv(ROOT_DIR / ".env")
 
-# ==========================================
-# [헬퍼 함수] 중복 로직을 재사용하기 위한 함수들
-# ==========================================
-def extract_text(file_path=None, content=None, file_ext=None):
-    """파일에서 텍스트를 추출합니다. (PDF 또는 텍스트 파일)"""
+DATA_DIR = BASE_DIR / "data"
+CHROMA_DB_PATH = BASE_DIR / "chroma_data"
 
-    def read_pdf(reader: pypdf.PdfReader) -> str:
-        # ✅ extract_text()가 None을 반환하는 PDF가 종종 있음 -> 안전 처리
-        texts = []
-        for p in reader.pages:
-            texts.append(p.extract_text() or "")
-        return "\n".join(texts)
+ALLOWED_EXTENSIONS = {".md", ".txt", ".pdf"}
+COLLECTION_NAME = "cs_interview_docs"
+EMBEDDING_MODEL_NAME = "jhgan/ko-sroberta-multitask"
+GPT_MODEL = "gpt-5.4-nano"
 
-    if file_path:
-        ext = file_path.suffix.lower()
-        if ext == ".pdf":
-            return read_pdf(pypdf.PdfReader(file_path))
-        return file_path.read_text(encoding="utf-8", errors="ignore")
+CHUNK_SIZE = 900
+CHUNK_OVERLAP = 120
+SIMILARITY_THRESHOLD = 0.60
+MAX_CONTEXT_CHARS = 6000
 
-    if content is not None and file_ext:
-        if file_ext == ".pdf":
-            return read_pdf(pypdf.PdfReader(io.BytesIO(content)))
-        return content.decode("utf-8", errors="ignore")
+rag_model: SentenceTransformer | None = None
+openai_client: OpenAI | None = None
+collection: Any = None
 
+
+class ChatReq(BaseModel):
+    message: str = Field(..., min_length=1, examples=["B-Tree 인덱스가 무엇인지 설명해줘"])
+
+
+def get_openai_client() -> OpenAI:
+    if openai_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY 환경변수가 설정되지 않았습니다. API 키를 설정한 뒤 다시 요청하세요.",
+        )
+    return openai_client
+
+
+def get_rag_model() -> SentenceTransformer:
+    if rag_model is None:
+        raise HTTPException(status_code=503, detail="임베딩 모델이 아직 준비되지 않았습니다.")
+    return rag_model
+
+
+def get_collection() -> Any:
+    if collection is None:
+        raise HTTPException(status_code=503, detail="벡터 DB가 아직 준비되지 않았습니다.")
+    return collection
+
+
+def extract_text_from_pdf_bytes(content: bytes, source: str) -> str:
+    try:
+        reader = pypdf.PdfReader(io.BytesIO(content))
+        return "\n".join((page.extract_text() or "") for page in reader.pages)
+    except Exception as exc:
+        logger.warning("PDF 텍스트 추출 실패, skip: %s (%s)", source, exc)
+        return ""
+
+
+def extract_text(file_path: Path | None = None, content: bytes | None = None, file_ext: str | None = None) -> str:
+    try:
+        if file_path is not None:
+            ext = file_path.suffix.lower()
+            if ext == ".pdf":
+                return extract_text_from_pdf_bytes(file_path.read_bytes(), str(file_path))
+            return file_path.read_text(encoding="utf-8", errors="ignore")
+
+        if content is not None and file_ext is not None:
+            if file_ext == ".pdf":
+                return extract_text_from_pdf_bytes(content, "uploaded-pdf")
+            return content.decode("utf-8", errors="ignore")
+    except UnicodeError as exc:
+        logger.warning("인코딩 오류로 파일을 건너뜁니다: %s", exc)
+    except Exception as exc:
+        logger.warning("파일 읽기 실패: %s", exc)
     return ""
 
-def chunk_text(text, size=CHUNK_SIZE, overlap=OVERLAP):
-    """텍스트를 지정된 크기로 분할하며 겹치는 부분을 포함합니다."""
-    if overlap >= size:
-        raise ValueError("Overlap must be less than chunk size")
-    chunks = []
+
+def relative_source(file_path: Path) -> str:
+    return file_path.relative_to(DATA_DIR).as_posix()
+
+
+def category_from_source(source: str) -> str:
+    parts = Path(source).parts
+    return parts[0] if parts else "uncategorized"
+
+
+def normalize_whitespace(text: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def split_markdown_sections(text: str, default_section: str) -> list[tuple[str, str]]:
+    matches = list(re.finditer(r"(?m)^(#{1,3})\s+(.+?)\s*$", text))
+    if not matches:
+        return [(default_section, normalize_whitespace(text))]
+
+    sections: list[tuple[str, str]] = []
+    preface = normalize_whitespace(text[: matches[0].start()])
+    if preface:
+        sections.append(("문서 개요", preface))
+
+    for idx, match in enumerate(matches):
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        title = match.group(2).strip()
+        body = normalize_whitespace(text[start:end])
+        if body:
+            sections.append((title, body))
+    return sections
+
+
+def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+    text = normalize_whitespace(text)
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
+    if overlap >= chunk_size:
+        raise ValueError("CHUNK_OVERLAP must be smaller than CHUNK_SIZE")
+
+    chunks: list[str] = []
     start = 0
     while start < len(text):
-        end = start + size
-        chunks.append(text[start:end])
-        start += size - overlap
+        end = min(start + chunk_size, len(text))
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        if end == len(text):
+            break
+        start = max(end - overlap, start + 1)
     return chunks
 
-def normalize(vecs):
-    """
-    L2 정규화 (1D/2D 모두 지원)
-    - vecs: (d,) 또는 (n, d)
-    """
-    arr = np.asarray(vecs, dtype=np.float32)
 
-    # 1D 벡터면 (1, d)로 바꿔서 처리
-    if arr.ndim == 1:
-        denom = np.linalg.norm(arr) + 1e-12
-        return arr / denom
-
-    # 2D 배치면 행 단위로 정규화
-    denom = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-12
-    return arr / denom
-
-
-def add_to_db(chunks, source):
-    """청크들을 DB와 ChromaDB에 추가합니다."""
-    global DB, DB_EMBEDDINGS
-    start_id = len(DB)
-    new_items = [{"id": str(start_id + i), "text": c, "source": source} for i, c in enumerate(chunks)]
-    DB.extend(new_items)
-
-    # 검색 기능을 위한 임베딩 백터 생성
-    new_embeddings = rag_model.encode([item["text"] for item in new_items])
-    new_embeddings = normalize(new_embeddings)
-
-    if DB_EMBEDDINGS is None or len(DB_EMBEDDINGS) == 0:
-        DB_EMBEDDINGS = new_embeddings
-    else:
-        DB_EMBEDDINGS = np.vstack([DB_EMBEDDINGS, new_embeddings])
-
-    # chromaDB에 임베딩 벡터 저장
-    collection.add(
-        documents=[item["text"] for item in new_items],
-        embeddings=new_embeddings.tolist(),
-        metadatas=[{"source": item["source"]} for item in new_items],
-        ids=[item["id"] for item in new_items]
+def build_chunks_for_document(text: str, source: str, file_ext: str) -> list[dict[str, Any]]:
+    category = category_from_source(source)
+    default_section = Path(source).stem
+    sections = (
+        split_markdown_sections(text, default_section)
+        if file_ext == ".md"
+        else [("전체 문서", normalize_whitespace(text))]
     )
-    return len(new_items)
+
+    items: list[dict[str, Any]] = []
+    for section_title, section_text in sections:
+        for chunk_index, chunk in enumerate(chunk_text(section_text)):
+            items.append(
+                {
+                    "text": chunk,
+                    "metadata": {
+                        "source": source,
+                        "category": category,
+                        "section": section_title,
+                        "chunk_index": chunk_index,
+                    },
+                }
+            )
+    return items
 
 
-# ==========================================
-# [서버 수명주기] 시작 시 1회 실행되는 초기화 로직
-# ==========================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global DB, DB_EMBEDDINGS, rag_model, openai_client, collection
+def make_chunk_id(source: str, section: str, chunk_index: int, text: str) -> str:
+    digest = hashlib.sha1(f"{source}:{section}:{chunk_index}:{text}".encode("utf-8")).hexdigest()
+    return digest
 
-    # 1. 각종 클라이언트 및 모델 로딩
-    print("1. AI 모델 및 클라이언트 초기화 중...")
-    openai_client = OpenAI(api_key=OPENAI_API_KEY)
-    rag_model = SentenceTransformer(RAG_MODEL_NAME)
-    
-    # ChromaDB 연결 (기존 데이터 삭제 후 새로 생성 - 항상 최신 상태 유지)
-    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-    try: 
-        chroma_client.delete_collection("ssafy_docs") # 기존 데이터 삭제
-    except: 
-        pass 
-    collection = chroma_client.create_collection("ssafy_docs", metadata={"hnsw:space": "cosine"})
 
-# 2. 데이터 로딩 (PDF 포함 모든 파일)
-    print(f"2. 파일 읽는 중... [{DATA_DIR}]")
-    for f in DATA_DIR.glob("*"):
-        if not f.is_file(): continue
+def embed_texts(texts: list[str]) -> list[list[float]]:
+    model = get_rag_model()
+    embeddings = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+    return embeddings.tolist()
+
+
+def add_chunks_to_collection(chunks: list[dict[str, Any]]) -> int:
+    if not chunks:
+        return 0
+
+    docs = [chunk["text"] for chunk in chunks]
+    metas = [chunk["metadata"] for chunk in chunks]
+    ids = [
+        make_chunk_id(meta["source"], meta["section"], int(meta["chunk_index"]), doc)
+        for doc, meta in zip(docs, metas)
+    ]
+    embeddings = embed_texts(docs)
+
+    # 중복 처리 정책:
+    # 서버 시작 시에는 컬렉션을 재생성해 현재 data 폴더 상태와 DB를 일치시킨다.
+    # 업로드 또는 런타임 추가 시에는 upsert를 사용해 동일 id 문서는 갱신하고 신규 문서는 추가한다.
+    get_collection().upsert(documents=docs, embeddings=embeddings, metadatas=metas, ids=ids)
+    return len(chunks)
+
+
+def iter_data_files() -> list[Path]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    files: list[Path] = []
+    for root, _, filenames in os.walk(DATA_DIR):
+        for filename in filenames:
+            path = Path(root) / filename
+            if path.suffix.lower() in ALLOWED_EXTENSIONS:
+                files.append(path)
+    return sorted(files)
+
+
+def load_data_documents() -> int:
+    total_chunks = 0
+    files = iter_data_files()
+    if not files:
+        logger.warning("data 폴더에 인덱싱할 문서가 없습니다: %s", DATA_DIR)
+        return 0
+
+    logger.info("문서 인덱싱 시작: %s개 파일", len(files))
+    for file_path in files:
+        source = relative_source(file_path)
         try:
-            text = extract_text(file_path=f)
-            if not text.strip(): continue
-            chunks = chunk_text(text)
-            add_to_db(chunks, f.name)
-            print(f"   - [성공] {f.name}")
-        except Exception as e:
-            print(f"[로드 실패] {f.name}: {e}")
-
-    print(f"3. 벡터 생성 완료! (총 {len(DB)}개 청크)")
-    
-    print("준비 완료! 서버가 시작되었습니다.")
-    yield # 서버 가동
-    print("서버가 종료됩니다.")
-
-tags_metadata = [
-    {"name": "Chat", "description": "GPT 채팅 관련 API"},
-    {"name": "Search", "description": "벡터 검색 API"},
-    {"name": "RAG", "description": "검색 + 생성 통합 API"},
-    {"name": "Upload", "description": "문서 업로드 API"},
-]
-
-app = FastAPI(
-    title="SSAFY RAG Chatbot API",
-    description="RAG 기반 챗봇 서버 (FastAPI + ChromaDB + OpenAI)",
-    version="1.0.0",
-    lifespan=lifespan,
-    openapi_tags=tags_metadata,
-    debug=True,
-)
-
-# CORS 설정 (모든 요청 허용)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
-)
-
-# 요청 데이터 구조 정의
-class ChatReq(BaseModel):
-    message: str
-
-    model_config = {
-        "json_schema_extra": {
-            "examples": [{"message": "SSAFY 수료 기준에 대해서 알려줘"}]
-        }
-    }
+            text = extract_text(file_path=file_path)
+            if not text.strip():
+                logger.info("빈 파일 skip: %s", source)
+                continue
+            chunks = build_chunks_for_document(text, source, file_path.suffix.lower())
+            added = add_chunks_to_collection(chunks)
+            total_chunks += added
+            logger.info("인덱싱 완료: %s (%s chunks)", source, added)
+        except Exception as exc:
+            logger.warning("문서 인덱싱 실패: %s (%s)", source, exc)
+    logger.info("문서 인덱싱 종료: 총 %s chunks", total_chunks)
+    return total_chunks
 
 
-# ==========================================
-# [API 1] 일반 채팅 (GPT 그대로 사용)
-# ==========================================
-@app.post("/chat", tags=["Chat"], summary="일반 채팅", description="GPT 모델에 메시지를 그대로 전달해 답변을 받습니다.")
-def chat(req: ChatReq):
-    res = openai_client.chat.completions.create(
-        model=GPT_MODEL,
-        messages=[{"role": "user", "content": req.message}]
+def chroma_distance_to_similarity(distance: float) -> float:
+    return max(0.0, min(1.0, 1.0 - float(distance)))
+
+
+def vector_search(query: str, top_k: int) -> list[dict[str, Any]]:
+    count = get_collection().count()
+    if count == 0:
+        return []
+
+    query_embedding = embed_texts([query])[0]
+    results = get_collection().query(
+        query_embeddings=[query_embedding],
+        n_results=min(top_k, count),
+        include=["documents", "metadatas", "distances"],
     )
-    return {"answer": res.choices[0].message.content}
-
-
-# ==========================================
-# [API 2] 단순 검색 (Numpy cosine similarity)
-# - debug/top_k 옵션은 교육용 디버깅에 매우 유용(검색 후보를 눈으로 확인 가능)
-# ==========================================
-@app.post("/search", tags=["Search"], summary="벡터 유사도 검색", description="질문을 임베딩한 뒤 코사인 유사도로 가장 비슷한 청크를 반환합니다.")
-def search(
-    req: ChatReq
-):
-    if DB_EMBEDDINGS is None or len(DB) == 0:
-        return {"answer": "DB가 비어있습니다. data 폴더에 문서를 넣거나 upload 하세요.", "score": None, "source": None}
-
-    query_vec = normalize(rag_model.encode(req.message))  # (d,)
-    scores = np.dot(DB_EMBEDDINGS, query_vec)             # cosine similarity처럼 해석 가능
-
-    best_idx = int(scores.argmax())
-    best_score = float(scores[best_idx])
-
-    if best_score < SIMILARITY_THRESHOLD:
-        return {
-            "answer": "관련된 내용을 찾을 수 없습니다.",
-            "score": best_score,
-            "source": None
-        }
-
-    return {
-        "answer": DB[best_idx]["text"],
-        "score": best_score,
-        "source": DB[best_idx]["source"]
-        }
-
-
-# ==========================================
-# [API 3] 통합 채팅 (RAG: 검색 + 생성)
-# - n_results=1 → 3으로 상향 (한 청크가 빗나가도 안전)
-# - threshold 통과한 청크만 컨텍스트에 포함
-# ==========================================
-@app.post("/integrated-chat", tags=["RAG"], summary="RAG 통합 채팅", description="ChromaDB 검색 결과를 컨텍스트로 GPT에 전달해 답변을 생성합니다.")
-def integrated_chat(
-    req: ChatReq,
-    n_results: int = Query(3, ge=1, le=8),
-    debug: bool = Query(False)
-):
-    q = normalize(rag_model.encode([req.message]))  # (1, d) 정규화
-    results = collection.query(query_embeddings=q.tolist(), n_results=n_results)
 
     docs = results.get("documents", [[]])[0]
     metas = results.get("metadatas", [[]])[0]
-    dists = results.get("distances", [[]])[0]
+    distances = results.get("distances", [[]])[0]
 
-    # Chroma는 distance(작을수록 유사)를 주므로 similarity로 변환해서 사용
-    candidates = []
-    for doc, meta, dist in zip(docs, metas, dists):
-        sim = 1.0 - float(dist)
-        candidates.append({
-            "source": meta.get("source"),
-            "similarity": sim,
-            "text": doc
-        })
-
-    # ✅ (개선) threshold 통과한 것만 컨텍스트로 사용
-    picked = [c for c in candidates if c["similarity"] >= SIMILARITY_THRESHOLD]
-
-    if picked:
-        # 여러 청크를 하나의 컨텍스트로 합침 (너무 길어지면 top 몇 개만)
-        picked = sorted(picked, key=lambda x: x["similarity"], reverse=True)[:n_results]
-        context = "\n\n".join(
-            [f"[출처: {p['source']} | 유사도: {p['similarity']:.2f}]\n{p['text']}" for p in picked]
+    search_results: list[dict[str, Any]] = []
+    for doc, meta, distance in zip(docs, metas, distances):
+        search_results.append(
+            {
+                "text": doc,
+                "source": meta.get("source", "unknown"),
+                "category": meta.get("category", "uncategorized"),
+                "section": meta.get("section", ""),
+                "similarity": round(chroma_distance_to_similarity(distance), 4),
+            }
         )
-        # 출처 태그는 여러 개일 수 있으니 요약해서 표시
-        source_tag = ", ".join(sorted({p["source"] for p in picked}))
-    else:
-        context = "(검색결과 없음)"
-        source_tag = "ChatGPT 일반 지식"
+    return search_results
 
-    prompt = f"""
-당신은 SSAFY 교육 과정을 돕는 AI 어시스턴트입니다.
-아래의 [참고 문서] 내용을 바탕으로 사용자의 질문에 답변하세요.
-문서에 없는 내용은 지어내지 말고, 일반 지식으로 답변하되
-문서에 없다는 점을 언급해주세요.
 
-[참고문서]
+def build_rag_prompt(context: str, used_rag: bool) -> str:
+    return f"""
+당신은 CS 기술 면접을 돕는 한국어 RAG 챗봇입니다.
+답변은 반드시 한국어로 작성합니다.
+검색 문서가 질문과 직접 관련된 경우에만 참고 문서 기반으로 답변합니다.
+참고 문서가 질문과 직접 관련 없거나 근거가 부족하면 문서를 억지로 사용하지 않습니다.
+used_rag=False인 경우 일반 지식 기반 답변을 허용합니다.
+모르는 내용은 꾸며내지 말고 모른다고 답변합니다.
+문서를 그대로 복붙하지 말고 자연스럽게 설명합니다.
+마크다운 문법 사용을 최소화하고, 굵은 글씨는 사용하지 않습니다.
+과도한 bullet list 대신 사람이 말하듯 자연스러운 문장으로 답변합니다.
+핵심 개념을 먼저 쉽게 설명하고, 필요할 때만 짧은 예시를 추가합니다.
+설명은 CS 기술 면접에서 바로 말할 수 있는 수준으로 간결하게 정리합니다.
+답변 앞에 참고 문서 기반 여부를 알리는 고정 문구를 붙이지 않습니다.
+
+[참고 문서]
 {context}
 """.strip()
 
-    res = openai_client.chat.completions.create(
-        model=GPT_MODEL,
-        messages=[
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": req.message}
-        ]
+
+def answer_policy_prefix(used_rag: bool) -> str:
+    return (
+        "참고 문서 기반 답변입니다."
+        if used_rag
+        else "참고 문서에서 충분한 근거를 찾지 못해 일반 지식 기반으로 답변합니다."
     )
 
-    payload = {"answer": res.choices[0].message.content, "source": source_tag}
+
+def ensure_policy_prefix(answer: str, used_rag: bool) -> str:
+    return (answer or "").strip()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global rag_model, openai_client, collection
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    CHROMA_DB_PATH.mkdir(parents=True, exist_ok=True)
+
+    api_key = os.getenv("OPENAI_API_KEY")
+    if api_key:
+        openai_client = OpenAI(api_key=api_key)
+        logger.info("OpenAI client initialized from OPENAI_API_KEY")
+    else:
+        openai_client = None
+        logger.warning("OPENAI_API_KEY가 없습니다. /chat, /integrated-chat 호출 시 명확한 오류를 반환합니다.")
+
+    logger.info("임베딩 모델 로딩: %s", EMBEDDING_MODEL_NAME)
+    rag_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+    chroma_client = chromadb.PersistentClient(path=str(CHROMA_DB_PATH))
+    try:
+        chroma_client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass
+    collection = chroma_client.create_collection(COLLECTION_NAME, metadata={"hnsw:space": "cosine"})
+
+    load_data_documents()
+    logger.info("서버 준비 완료")
+
+    yield
+
+    logger.info("서버 종료")
+
+
+tags_metadata = [
+    {"name": "Chat", "description": "일반 OpenAI 챗봇 API"},
+    {"name": "Search", "description": "SentenceTransformer + ChromaDB 벡터 검색 API"},
+    {"name": "RAG", "description": "검색 문서 기반 통합 챗봇 API"},
+    {"name": "Upload", "description": "문서 업로드 및 동적 인덱싱 API"},
+]
+
+app = FastAPI(
+    title="CS RAG Chatbot API",
+    description="FastAPI, OpenAI, SentenceTransformer, ChromaDB 기반 CS 면접 RAG 챗봇",
+    version="1.0.0",
+    lifespan=lifespan,
+    openapi_tags=tags_metadata,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.error("Unhandled error: %s\n%s", exc, traceback.format_exc())
+    return JSONResponse(status_code=500, content={"detail": str(exc)})
+
+
+@app.get("/", tags=["Chat"])
+def health_check():
+    return {
+        "status": "ok",
+        "indexed_chunks": get_collection().count() if collection is not None else 0,
+        "data_dir": str(DATA_DIR),
+    }
+
+
+@app.post("/chat", tags=["Chat"], summary="일반 OpenAI 챗봇")
+def chat(req: ChatReq):
+    try:
+        res = get_openai_client().chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": "당신은 한국어로 답변하는 CS 학습 도우미입니다."},
+                {"role": "user", "content": req.message},
+            ],
+        )
+        return {"answer": res.choices[0].message.content}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OpenAI API 호출 실패: {exc}") from exc
+
+
+@app.post("/search", tags=["Search"], summary="벡터 검색")
+def search(req: ChatReq, top_k: int = Query(5, ge=1, le=20)):
+    results = vector_search(req.message, top_k)
+    return {"results": results}
+
+
+@app.post("/integrated-chat", tags=["RAG"], summary="RAG 통합 챗봇")
+def integrated_chat(
+    req: ChatReq,
+    top_k: int = Query(5, ge=1, le=20),
+    debug: bool = Query(False),
+):
+    candidates = vector_search(req.message, top_k)
+    picked = [candidate for candidate in candidates if candidate["similarity"] >= SIMILARITY_THRESHOLD]
+    used_rag = len(picked) > 0
+
+    if used_rag:
+        context_parts = []
+        current_length = 0
+        for item in picked:
+            block = (
+                f"[source: {item['source']} | section: {item['section']} | "
+                f"similarity: {item['similarity']}]\n{item['text']}"
+            )
+            if current_length + len(block) > MAX_CONTEXT_CHARS:
+                break
+            context_parts.append(block)
+            current_length += len(block)
+        context = "\n\n".join(context_parts)
+    else:
+        context = "검색된 참고 문서가 없거나 유사도가 기준값보다 낮습니다."
+
+    try:
+        res = get_openai_client().chat.completions.create(
+            model=GPT_MODEL,
+            messages=[
+                {"role": "system", "content": build_rag_prompt(context, used_rag)},
+                {"role": "user", "content": req.message},
+            ],
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OpenAI API 호출 실패: {exc}") from exc
+
+    sources = sorted({item["source"] for item in picked})
+    payload: dict[str, Any] = {
+        "answer": ensure_policy_prefix(res.choices[0].message.content, used_rag),
+        "used_rag": used_rag,
+        "sources": sources,
+    }
     if debug:
-        payload["candidates"] = [{"source": c["source"], "similarity": round(c["similarity"], 4)} for c in candidates]
-        payload["picked"] = [{"source": p["source"], "similarity": round(p["similarity"], 4)} for p in picked]
+        payload["debug"] = {
+            "candidates": candidates,
+            "selected_chunks": picked,
+            "similarity_threshold": SIMILARITY_THRESHOLD,
+        }
     return payload
 
-# ==========================================
-# [API 4] 파일 업로드 (동적 문서 추가)
-# ==========================================
-@app.post("/upload", tags=["Upload"], summary="문서 업로드", description="txt / md / pdf 파일을 업로드해 DB에 추가합니다.")
-async def upload_file(request: Request, file: UploadFile = File(...)):
-    # 허용된 파일 확장자 검사
-    allowed_extensions = {".txt", ".md", ".pdf"}
-    file_ext = Path(file.filename).suffix.lower()
 
-    if file_ext not in allowed_extensions:
+@app.post("/upload", tags=["Upload"], summary="문서 업로드")
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    file_ext = Path(file.filename or "").suffix.lower()
+    if file_ext not in ALLOWED_EXTENSIONS:
         return {
             "success": False,
-            "message": f"지원하지 않는 파일 형식입니다. ({', '.join(allowed_extensions)} 만 허용)"
+            "message": f"지원하지 않는 파일 형식입니다. 허용 형식: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         }
 
     try:
         content = await file.read()
         text = extract_text(content=content, file_ext=file_ext)
-
         if not text.strip():
-            return {"success": False, "message": "파일에 내용이 없습니다."}
+            return {"success": False, "message": "파일에서 읽을 수 있는 텍스트가 없습니다."}
 
-        chunks = chunk_text(text)
-        chunks_added = add_to_db(chunks, file.filename)
+        safe_name = Path(file.filename or "uploaded").name
+        save_path = DATA_DIR / safe_name
+        save_path.write_bytes(content)
 
-        # 파일을 data 폴더에도 저장 (서버 재시작 시에도 유지)
-        save_path = DATA_DIR / file.filename
-        with open(save_path, "wb") as f:
-            f.write(content)
+        chunks = build_chunks_for_document(text, safe_name, file_ext)
+        chunks_added = add_chunks_to_collection(chunks)
 
-        # Referer 헤더가 있으면 원래 페이지로 리다이렉트
         referer = request.headers.get("referer")
         if referer:
             return RedirectResponse(url=referer, status_code=303)
 
         return {
             "success": True,
-            "message": f"'{file.filename}' 업로드 완료! ({chunks_added}개 청크 추가)",
-            "chunks_added": chunks_added
+            "message": f"'{safe_name}' 업로드 및 인덱싱 완료",
+            "chunks_added": chunks_added,
         }
-
-    except Exception as e:
-        return {"success": False, "message": f"파일 처리 중 오류 발생: {str(e)}"}
+    except Exception as exc:
+        logger.error("업로드 처리 실패: %s\n%s", exc, traceback.format_exc())
+        return {"success": False, "message": f"파일 처리 중 오류 발생: {exc}"}
 
 
 if __name__ == "__main__":
     import uvicorn
-    # 0.0.0.0은 외부 접속을 허용한다는 의미입니다.
-    # reload=True: 코드 수정 시 서버 자동 재시작 (디버그/개발 모드)
-    # log_level="debug": 상세 로그 출력
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="debug",
-    )
+
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level="info")

@@ -12,6 +12,7 @@ pydantic~=2.12.5
 
 # OpenAI API
 openai~=2.8.1
+python-dotenv~=1.2.1
 
 # PDF Reader
 pypdf~=6.4.0
