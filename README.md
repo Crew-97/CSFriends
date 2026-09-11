@@ -1,23 +1,30 @@
-# CSFriends RAG Chatbot
-<img width="1920" height="1683" alt="image" src="https://github.com/user-attachments/assets/47e43962-6c1c-4ef2-82ba-e00e08bd7fc3" />
+# CSFriends · 기술 문서 기반 RAG 챗봇
 
-CSFriends는 CS 면접 및 기술 문서 데이터를 기반으로 답변하는 RAG 챗봇 프로젝트입니다. 기존 Frontend 디자인은 유지하고, FastAPI Backend에서 문서 재귀 탐색, 청킹, 임베딩, ChromaDB 검색, OpenAI 응답 생성을 담당합니다.
+CS 면접·기술 문서에서 질문과 관련된 내용을 찾아 답변에 연결하는 챗봇입니다. 기존 스켈레톤을 확장해 **FastAPI 백엔드의 문서 처리·검색·답변 생성·업로드 흐름**을 구현했습니다.
 
-## 해결한 문제와 개인 기여
+**서현식(Crew-97) · 백엔드**
 
-CS 면접·기술 문서를 하위 폴더까지 읽고, 질문과 관련된 문서를 찾아 답변 생성에 연결하는 백엔드를 구현했습니다. 기존 스켈레톤 챗봇을 확장한 프로젝트입니다.
+[개인 기여](#개인-기여) · [동작 구조](#동작-구조) · [실행 방법](#실행-방법) · [구현-검증 범위](#구현검증-범위) · [포트폴리오](https://dorian-insect-dbd.notion.site/3d7f9416d0c981e09550c74daf722192) · [GitHub 프로필](https://github.com/Crew-97)
 
-**서현식(Crew-97) · Backend**
+## 개인 기여
 
-| 담당 범위 | 구현한 내용 | 코드·기록 |
+| 담당 범위 | 구현한 내용 | 근거 |
 |---|---|---|
-| 문서 처리 | Markdown 제목별 분할, 하위 폴더 재귀 탐색, 출처·분류·제목 메타데이터 저장 | [백엔드 구현](./servers/main.py) |
-| 검색·답변 | 문서 임베딩과 ChromaDB 검색, 검색 문맥을 활용하는 FastAPI 답변 API | [백엔드 최종 변경](https://github.com/Crew-97/CSFriends/commit/b9b7acc) |
-| 문서 추가·화면 연결 | 업로드 문서의 즉시 인덱싱, 통합 API 호출과 중복 전송 방지 연결 | [연결 변경](https://github.com/Crew-97/CSFriends/commit/354883f), [수행 기록](./REPORT.md) |
+| 문서 처리 | 하위 폴더 재귀 탐색, Markdown 제목별 분할, 출처·분류·제목 메타데이터 저장 | [서버 코드](servers/main.py) |
+| 검색·답변 | SentenceTransformer 임베딩, ChromaDB 검색, 검색 문맥을 전달하는 답변 API | [백엔드 변경](https://github.com/Crew-97/CSFriends/commit/b9b7acc) |
+| 문서 추가·화면 연결 | 업로드 문서 즉시 인덱싱, 통합 API 호출, 중복 전송 방지 | [연결 변경](https://github.com/Crew-97/CSFriends/commit/354883f) · [수행 보고서](REPORT.md) |
 
-프론트 디자인·후속 UI 변경은 팀원 기여와 구분합니다. 외부 임베딩 모델과 OpenAI 모델을 사용했으며, 자체 모델 학습 경험을 뜻하지 않습니다.
+프론트 디자인과 후속 UI 변경은 팀원 기여입니다. 임베딩과 답변 생성에는 외부 모델을 사용합니다.
 
-## 요청이 처리되는 흐름
+## 서비스 화면
+
+<p align="center">
+  <img src="./결과예시.png" width="620" alt="CSFriends에서 트랜잭션 전파 속성을 질문하고 답변을 확인한 기존 화면">
+</p>
+
+저장소에 보관된 기존 실행 화면입니다. 화면의 답변은 검색 정확도 평가 결과를 뜻하지 않습니다.
+
+## 동작 구조
 
 ```mermaid
 flowchart LR
@@ -29,158 +36,121 @@ flowchart LR
  G --> A["답변 API"]
 ```
 
-관련도 기준에 맞는 문서가 없으면 일반 답변으로 전환합니다. API의 `used_rag`와 `sources`로 검색 문서 사용 여부를 구분할 수 있습니다.
+1. 서버 시작 시 `servers/data/` 아래 문서를 재귀 탐색합니다.
+2. Markdown은 제목별로 나누고, 긴 문서 조각은 길이와 겹침 기준으로 추가 분할합니다. TXT·PDF도 처리합니다.
+3. 각 조각에 `source`, `category`, `section`, `chunk_index`를 저장하고 임베딩합니다.
+4. 질문과 유사한 조각을 검색해 OpenAI 답변 생성에 전달합니다. 관련도 기준에 맞는 문서가 없으면 일반 답변으로 전환합니다.
+5. API는 답변과 함께 `used_rag`, `sources`를 반환합니다. 현재 화면에는 답변 본문을 표시합니다.
+
+[상세 흐름](docs/architecture/rag-architecture.md) · [예시 질문 모음](docs/sample-questions/)
 
 ## 기술 스택
 
-- Frontend: HTML, CSS, JavaScript
-- Backend: FastAPI, Uvicorn
-- LLM: OpenAI Chat Completions API
-- Embedding: SentenceTransformer `jhgan/ko-sroberta-multitask`
-- Vector DB: ChromaDB persistent mode
-- Document parsing: Markdown, TXT, PDF(`pypdf`)
-- Environment: `python-dotenv`
+| 구분 | 기술 |
+|---|---|
+| 백엔드 | Python, FastAPI, Uvicorn |
+| 문서 처리 | Markdown·TXT 파싱, pypdf |
+| 임베딩·검색 | SentenceTransformer `jhgan/ko-sroberta-multitask`, ChromaDB |
+| 답변 생성 | OpenAI Chat Completions API |
+| 화면 | HTML, CSS, JavaScript |
+| 설정 | python-dotenv, 루트 `.env` |
 
-## 프로젝트 구조
+## 실행 방법
 
-```text
-PJT_01_Chatbot/
-├─ .env.example
-├─ .gitignore
-├─ README.md
-├─ REPORT.md
-├─ docs/
-│  ├─ screenshots/
-│  ├─ architecture/
-│  └─ sample-questions/
-├─ index.html
-├─ script.js
-├─ style.css
-└─ servers/
-   ├─ main.py
-   ├─ requirements.txt
-   ├─ data/
-   └─ chroma_data/
-```
+Python·Git과 유효한 OpenAI API 키가 필요합니다. 최초 실행 시 임베딩 모델을 내려받고 문서를 인덱싱하므로 네트워크 연결과 준비 시간이 필요합니다. 의존성 버전 범위는 [requirements.txt](servers/requirements.txt)에 있습니다.
 
-## 설치 및 실행
+### 1. 저장소 준비
 
 ```bash
-cd servers
-python -m venv .venv
+git clone https://github.com/Crew-97/CSFriends.git
+cd CSFriends
 ```
+
+루트의 `.env.example`을 참고해 **루트 `.env`**에 아래 값을 설정합니다. 기존 파일은 보존하고 필요한 값만 수정합니다.
+
+```dotenv
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+예시 값을 실제 키로 바꾸되 `.env`는 Git에 올리지 않습니다. 키가 없으면 서버의 `/chat`, `/integrated-chat`은 답변을 생성할 수 없습니다.
+
+### 2. 백엔드 설치·실행
 
 Windows PowerShell:
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-$env:OPENAI_API_KEY="sk-..."
-python main.py
+cd servers
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe main.py
 ```
 
 macOS/Linux:
 
 ```bash
-source .venv/bin/activate
-pip install -r requirements.txt
-export OPENAI_API_KEY="sk-..."
-python main.py
+cd servers
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+.venv/bin/python main.py
 ```
 
-## .env 사용 방법
+가상환경의 Python을 직접 호출하므로 별도의 활성화 명령이 필요 없습니다. 서버가 준비되면 `http://localhost:8000/docs`에서 API 문서를 확인합니다.
 
-아래 작업은 `servers` 폴더가 아닌 **저장소 루트**에서 진행합니다. 기존 `.env`가 있다면 보존하고 필요한 값만 확인합니다.
+### 3. 프론트 열기
 
-```text
-OPENAI_API_KEY=sk-...
-```
+백엔드를 실행한 상태에서 저장소 루트의 `index.html`을 브라우저로 엽니다. `script.js`는 `http://localhost:8000/integrated-chat`으로 질문을 보냅니다.
 
-또는 예시 파일을 복사해서 사용할 수 있습니다.
+예시 질문:
 
-```powershell
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-```
-
-`.env.example`에는 실제 키를 넣지 않습니다.
-
-```text
-OPENAI_API_KEY=your_openai_api_key_here
-```
-
-보안상 `.env` 파일은 GitHub에 업로드하면 안 됩니다. 이 프로젝트의 `.gitignore`에는 `.env`가 포함되어 있어 실제 API 키가 커밋되지 않도록 구성되어 있습니다.
-
-## 서버 접속
-
-서버 실행 후 API 문서는 아래 주소에서 확인합니다.
-
-```text
-http://localhost:8000/docs
-```
-
-Frontend는 프로젝트 루트의 `index.html`을 브라우저에서 열어 사용할 수 있습니다.
-
-## RAG 동작 방식
-
-1. 서버 시작 시 `servers/data`를 `os.walk()`로 재귀 탐색합니다.
-2. `.md`, `.txt`, `.pdf` 파일만 읽고 빈 파일과 깨진 PDF는 skip합니다.
-3. Markdown은 `#`, `##`, `###` 제목 기준으로 section을 분리합니다.
-4. 긴 section은 `CHUNK_SIZE`, `CHUNK_OVERLAP` 기준으로 추가 청킹합니다.
-5. 각 chunk에 `source`, `category`, `section`, `chunk_index` metadata를 저장합니다.
-6. SentenceTransformer로 임베딩한 뒤 ChromaDB persistent collection에 저장합니다.
-7. `/integrated-chat` 요청 시 벡터 검색 결과를 context로 OpenAI 모델에 전달합니다.
-
-## data 폴더
-
-`servers/data`는 CS 면접/기술 문서의 원천 데이터 폴더입니다. 하위 폴더를 자유롭게 구성할 수 있으며 서버는 모든 하위 폴더를 재귀 탐색합니다.
-
-예시 metadata:
-
-```json
-{
-  "source": "02-backend-engineering/database/indexing.md",
-  "category": "02-backend-engineering",
-  "section": "B-Tree Index"
-}
-```
-
-## chroma_data 폴더
-
-`servers/chroma_data`는 ChromaDB 영속 저장소입니다. 폴더가 없으면 서버 시작 시 자동 생성됩니다. 현재 구현은 서버 시작 시 컬렉션을 재생성해 `data` 폴더의 최신 상태와 검색 DB를 일치시킵니다.
+- 프로세스와 스레드의 차이를 설명해줘.
+- TCP 3-way handshake 과정을 설명해줘.
+- B-Tree 인덱스가 데이터베이스 조회에 쓰이는 이유는?
 
 ## 주요 API
 
-- `POST /chat`: 일반 OpenAI 챗봇 응답
-- `POST /search?top_k=5`: 벡터 검색 결과와 similarity score 반환
-- `POST /integrated-chat?top_k=5&debug=false`: RAG 기반 메인 챗봇 응답
-- `POST /upload`: `.md`, `.txt`, `.pdf` 문서 업로드 및 즉시 인덱싱
+| 메서드·경로 | 역할 |
+|---|---|
+| `POST /chat` | 일반 OpenAI 답변 |
+| `POST /search?top_k=5` | 관련 문서와 유사도 점수 검색 |
+| `POST /integrated-chat?top_k=5&debug=false` | 문서 검색과 답변 생성 연결 |
+| `POST /upload` | Markdown·TXT·PDF 업로드 및 즉시 인덱싱 |
 
-`/integrated-chat` 응답 예시:
+통합 API의 응답 구조 예시입니다.
 
 ```json
 {
-  "answer": "참고 문서 기반 답변입니다. ...",
+  "answer": "답변 본문",
   "used_rag": true,
   "sources": ["02-backend-engineering/database/indexing.md"]
 }
 ```
 
-## 예시 질문
+## 프로젝트 구조
 
-- 프로세스와 스레드의 차이를 면접 답변처럼 설명해줘.
-- TCP 3-way handshake 과정을 설명해줘.
-- B-Tree 인덱스가 데이터베이스 조회 성능을 높이는 이유는?
-- 싱글톤 패턴의 장점과 단점은?
-- JWT 인증 방식의 장점과 주의할 점은?
+```text
+CSFriends/
+├─ README.md / REPORT.md
+├─ .env.example
+├─ index.html / script.js / style.css
+├─ 결과예시.png
+├─ docs/
+│  ├─ architecture/
+│  └─ sample-questions/
+└─ servers/
+   ├─ main.py
+   ├─ requirements.txt
+   └─ data/
+```
 
-## 확인된 범위와 남은 개선
+`servers/chroma_data/`는 실행 시 생성되는 검색 DB 저장 위치입니다. 현재 서버는 시작할 때 컬렉션을 다시 만들고 `data/`의 문서를 인덱싱합니다.
 
-- 문서 분할·검색·업로드 API는 구현돼 있습니다. 현재 프론트는 답변 본문을 표시하며, 출처와 문서 사용 여부의 화면 표시는 보완 대상입니다. 업로드 API와 업로드 화면 제공도 구분합니다.
-- 같은 파일명의 변경 문서를 재업로드하면 이전 조각이 남을 수 있습니다. 서버 재시작 시 컬렉션을 재생성하는 동작과 실행 중 문서 갱신 처리는 다릅니다.
-- 검색 문맥 길이를 제한할 때 반환 출처 목록에 문맥에서 제외된 문서가 포함될 수 있어, 실제 사용 문서만 반환하도록 보완이 필요합니다.
-- 2026-09-10 검토에서는 코드·분할 로직과 모의 객체를 사용한 갱신·출처 사례를 확인했습니다. 실제 모델 다운로드·OpenAI 호출·전체 서버 실행을 재검증하지 않았습니다.
-- 검색 정확도·응답 속도·사용자 규모의 측정 결과는 확보하지 않았습니다. 청킹 길이·유사도 기준 변경을 정량 성능 향상으로 제시하지 않습니다.
+## 구현·검증 범위
 
-## 실행 화면 캡처 위치
+문서 분할·검색·답변 생성·업로드 API와 화면의 통합 API 호출이 구현돼 있습니다. 2026.09.10에는 코드·분할 로직과 모의 객체를 통한 문서 갱신·출처 사례를 확인했고, 2026.09.11에는 README와 현재 코드·파일 경로를 다시 대조했습니다. 실제 모델 다운로드·OpenAI 호출·전체 서버 실행을 이번 문서 정리에서 재검증한 것은 아닙니다.
 
-제출용 실행 화면은 `docs/screenshots/` 폴더에 저장합니다. 예: `docs/screenshots/chat-result.png`, `docs/screenshots/search-api.png`
+보완할 부분:
+
+- **문서 갱신:** 같은 파일명의 변경 문서를 재업로드하면 이전 조각이 남을 수 있습니다. 서버 재시작 때의 전체 재생성과 실행 중 갱신 처리는 다릅니다.
+- **출처 정확성:** 문맥 길이 제한으로 제외된 문서가 `sources`에 포함될 수 있어 실제 사용한 문서와 맞추는 작업이 필요합니다.
+- **화면 연결:** 출처·문서 사용 여부 표시와 문서 업로드 UI는 보완 대상입니다.
+- **품질 평가:** 질문별 검색 결과·출처를 확인하는 평가가 필요합니다. 검색 정확도·응답 속도·사용자 규모의 측정 결과는 아직 제시하지 않습니다.

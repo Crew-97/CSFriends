@@ -1,5 +1,7 @@
 # CSFriends RAG Chatbot Report
 
+> 프로젝트 수행 당시 작성한 보고서입니다. 현재 실행 안내와 코드 검토에서 확인한 범위·개선 사항은 [README](README.md)에 정리했습니다. 아래 수행 후기와 원래 서술은 작성 당시 기록으로 보존합니다.
+
 ## 생성형 AI API 호출 흐름
 
 사용자가 Frontend에서 질문을 입력하면 `script.js`가 FastAPI의 `/integrated-chat` API로 메시지를 전송한다. 서버는 질문을 SentenceTransformer로 임베딩하고 ChromaDB에서 관련 chunk를 검색한다. 검색 결과 중 similarity가 기준값 이상인 chunk만 context로 사용하며, 근거가 부족하면 일반 LLM 답변으로 전환한다. 최종 응답은 `answer`, `used_rag`, `sources`를 포함한 JSON 형식으로 반환된다.
